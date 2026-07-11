@@ -322,6 +322,13 @@ pub struct RestClientConfig {
 /// REST catalog client implementation.
 ///
 /// Implements the Apache Iceberg REST Catalog API specification.
+///
+/// Multi-warehouse catalogs (e.g. Lakekeeper) negotiate a per-warehouse
+/// `prefix` via `GET /v1/config?warehouse=<id>`. The `prefix` returned in
+/// `overrides` is injected into the path of every subsequent request
+/// (`/v1/namespaces` -> `/v1/{prefix}/namespaces`). When a catalog does
+/// not support multiple warehouses it simply omits `prefix`, and requests stay
+/// on the unprefixed paths (backward compatible).
 pub struct RestCatalogClient {
     /// HTTP client
     client: Client,
@@ -333,6 +340,8 @@ pub struct RestCatalogClient {
     last_health_check: RwLock<Option<CatalogHealth>>,
     /// Circuit breaker for fault tolerance
     circuit_breaker: CircuitBreaker,
+    /// Resolved warehouse `prefix` from `/v1/config` `overrides`, if any.
+    resolved_prefix: RwLock<Option<String>>,
 }
 
 /// Cached OAuth2 token with expiry.
@@ -381,7 +390,18 @@ impl RestCatalogClient {
             oauth_token: RwLock::new(None),
             last_health_check: RwLock::new(None),
             circuit_breaker,
+            resolved_prefix: RwLock::new(None),
         };
+
+        // For multi-warehouse REST catalogs (Lakekeeper, etc.) negotiate the
+        // warehouse `prefix` up front. Single-warehouse catalogs that omit a
+        // `prefix` simply stay on the unprefixed paths.
+        match client.fetch_config_prefix().await {
+            Ok(prefix) => *client.resolved_prefix.write() = prefix,
+            Err(e) => {
+                warn!(error = %e, "Failed to resolve catalog config prefix; continuing without a warehouse prefix");
+            }
+        }
 
         // Perform initial token fetch if using OAuth2
         if config.rest.credential_type == CredentialType::OAuth2 {
@@ -480,8 +500,43 @@ impl RestCatalogClient {
         Ok(())
     }
 
-    /// Build a request with authentication.
-    async fn build_request(
+    /// Resolve the warehouse `prefix` from the Iceberg REST `/v1/config` endpoint.
+    ///
+    /// Passes `?warehouse=<warehouse_path>` as required by multi-warehouse
+    /// catalogs (e.g. Lakekeeper). Returns `Some(prefix)` when the server
+    /// advertises one in `overrides`, or `None` when the catalog serves a
+    /// single warehouse (no `prefix` returned).
+    ///
+    /// Uses the raw request builder to avoid recursing into prefix injection.
+    async fn fetch_config_prefix(&self) -> Result<Option<String>> {
+        let encoded = urlencoding::encode(&self.config.warehouse_path);
+        let path = format!("/v1/config?warehouse={}", encoded);
+        let request = self.build_request_raw(reqwest::Method::GET, &path).await?;
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::Iceberg(IcebergError::CatalogConnection(e.to_string())))?;
+
+        if !response.status().is_success() {
+            // Single-warehouse catalogs (or servers that don't require the query
+            // param) may reject/ignore the request; treat as "no prefix".
+            return Ok(None);
+        }
+
+        let config: rest_api::CatalogConfig = response
+            .json()
+            .await
+            .map_err(|e| Error::Iceberg(IcebergError::Other(e.to_string())))?;
+
+        Ok(config.overrides.get("prefix").cloned())
+    }
+
+    /// Build a request with authentication, WITHOUT warehouse `prefix` injection.
+    ///
+    /// Used for `/v1/config` and `/v1/oauth/tokens`, which must not be
+    /// prefixed (the prefix is discovered from `/v1/config` itself).
+    async fn build_request_raw(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -497,6 +552,27 @@ impl RestCatalogClient {
         request = request.header("Accept", "application/json");
 
         Ok(request)
+    }
+
+    /// Build a request with authentication.
+    ///
+    /// If a warehouse `prefix` was resolved from `/v1/config`, it is inserted
+    /// into the path immediately after `/v1` (e.g. `/v1/{prefix}/namespaces`).
+    /// For single-warehouse catalogs the path is left unchanged.
+    async fn build_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        let prefix = self.resolved_prefix.read().clone();
+        let prefixed = match prefix {
+            Some(prefix) if !prefix.is_empty() => path
+                .strip_prefix("/v1")
+                .map(|rest| format!("/v1/{}{}", prefix, rest))
+                .unwrap_or_else(|| path.to_string()),
+            _ => path.to_string(),
+        };
+        self.build_request_raw(method, &prefixed).await
     }
 
     /// Check if circuit breaker allows the request.
@@ -645,9 +721,20 @@ impl CatalogOperations for RestCatalogClient {
     async fn health_check(&self) -> Result<CatalogHealth> {
         let start = Instant::now();
 
-        // Try to get config endpoint which is the standard health check
+        // Re-resolve the warehouse `prefix` on every health check so a
+        // warehouse rename/rotation in Lakekeeper is picked up without
+        // restarting k2i. A failed resolution keeps the last known prefix.
+        if let Ok(prefix) = self.fetch_config_prefix().await {
+            *self.resolved_prefix.write() = prefix;
+        }
+
+        // Try to get config endpoint which is the standard health check.
+        // Pass `?warehouse=` so multi-warehouse catalogs route to the
+        // correct warehouse.
+        let encoded = urlencoding::encode(&self.config.warehouse_path);
+        let config_path = format!("/v1/config?warehouse={}", encoded);
         let request = self
-            .build_request(reqwest::Method::GET, "/v1/config")
+            .build_request_raw(reqwest::Method::GET, &config_path)
             .await?;
 
         match request.send().await {
@@ -1197,6 +1284,180 @@ mod tests {
         // Health check returns unhealthy when server is unreachable
         // but the check itself succeeds (doesn't error)
         assert_eq!(health.catalog_type, CatalogType::Rest);
+    }
+
+    /// Build a minimal REST catalog config pointing at `rest_uri` with the
+    /// given `warehouse_path`.
+    fn test_config(warehouse_path: &str, rest_uri: &str) -> IcebergConfig {
+        IcebergConfig {
+            catalog_type: CatalogType::Rest,
+            warehouse_path: warehouse_path.to_string(),
+            database_name: "db".into(),
+            table_name: "table".into(),
+            target_file_size_mb: 512,
+            compression: crate::config::ParquetCompression::Snappy,
+            partition_spec: vec![],
+            rest_uri: Some(rest_uri.to_string()),
+            hive_metastore_uri: None,
+            aws_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            s3_endpoint: None,
+            catalog_manager: Default::default(),
+            table_management: Default::default(),
+            rest: Default::default(),
+            glue: Default::default(),
+            nessie: None,
+            sql_catalog: None,
+            object_store: Default::default(),
+        }
+    }
+
+    /// Spawn a minimal axum server backing a fake Iceberg REST catalog.
+    ///
+    /// `/v1/config` responds with `overrides.prefix = config_prefix` (or no
+    /// `prefix` key when `config_prefix` is `None`, simulating a
+    /// single-warehouse catalog). `/v1/{prefix}/namespaces` (or
+    /// `/v1/namespaces` when there is no prefix) responds with an empty
+    /// namespace list. Every request path+query actually received by the
+    /// server is recorded and returned for assertions.
+    async fn spawn_fake_catalog(
+        config_prefix: Option<&str>,
+    ) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        use axum::extract::{OriginalUri, State};
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        #[derive(Clone)]
+        struct FakeCatalogState {
+            config_prefix: Option<String>,
+            seen: Arc<parking_lot::Mutex<Vec<String>>>,
+        }
+
+        async fn handle_config(
+            State(state): State<FakeCatalogState>,
+            OriginalUri(uri): OriginalUri,
+        ) -> Json<serde_json::Value> {
+            state.seen.lock().push(uri.to_string());
+            let mut overrides = serde_json::Map::new();
+            if let Some(prefix) = &state.config_prefix {
+                overrides.insert("prefix".to_string(), serde_json::json!(prefix));
+            }
+            Json(serde_json::json!({
+                "defaults": {},
+                "overrides": overrides,
+            }))
+        }
+
+        async fn handle_namespaces(
+            State(state): State<FakeCatalogState>,
+            OriginalUri(uri): OriginalUri,
+        ) -> Json<serde_json::Value> {
+            state.seen.lock().push(uri.to_string());
+            Json(serde_json::json!({ "namespaces": [] }))
+        }
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let state = FakeCatalogState {
+            config_prefix: config_prefix.map(|p| p.to_string()),
+            seen: seen.clone(),
+        };
+
+        let namespaces_path = match config_prefix {
+            Some(prefix) => format!("/v1/{}/namespaces", prefix),
+            None => "/v1/namespaces".to_string(),
+        };
+
+        let app = Router::new()
+            .route("/v1/config", get(handle_config))
+            .route(&namespaces_path, get(handle_namespaces))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake catalog listener");
+        let addr = listener.local_addr().expect("listener local addr");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fake catalog server");
+        });
+
+        (format!("http://{}", addr), seen)
+    }
+
+    #[tokio::test]
+    async fn test_health_check_sends_warehouse_query_param() {
+        let (rest_uri, seen) = spawn_fake_catalog(None).await;
+        let config = test_config("my-warehouse", &rest_uri);
+
+        let client = RestCatalogClient::new(&config, rest_uri.clone())
+            .await
+            .unwrap();
+
+        let health = client.health_check().await.unwrap();
+        assert!(health.is_healthy);
+
+        let requests = seen.lock().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|path| path.starts_with("/v1/config") && path.contains("warehouse=my-warehouse")),
+            "expected a /v1/config request with ?warehouse=my-warehouse, got: {:?}",
+            requests
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_prefix_when_catalog_omits_override() {
+        // Single-warehouse catalogs don't return `overrides.prefix`; k2i must
+        // keep using unprefixed paths (backward-compatible behavior).
+        let (rest_uri, seen) = spawn_fake_catalog(None).await;
+        let config = test_config("s3://bucket/warehouse", &rest_uri);
+
+        let client = RestCatalogClient::new(&config, rest_uri.clone())
+            .await
+            .unwrap();
+
+        let namespaces = client.list_namespaces().await.unwrap();
+        assert!(namespaces.is_empty());
+
+        let requests = seen.lock().clone();
+        assert!(
+            requests.iter().any(|path| path.starts_with("/v1/namespaces")),
+            "expected an unprefixed /v1/namespaces request, got: {:?}",
+            requests
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prefix_injected_into_subsequent_requests() {
+        // Multi-warehouse catalogs (e.g. Lakekeeper) return `overrides.prefix`;
+        // k2i must inject it into every subsequent REST call.
+        let (rest_uri, seen) = spawn_fake_catalog(Some("wh-123")).await;
+        let config = test_config("my-warehouse", &rest_uri);
+
+        let client = RestCatalogClient::new(&config, rest_uri.clone())
+            .await
+            .unwrap();
+
+        let namespaces = client.list_namespaces().await.unwrap();
+        assert!(namespaces.is_empty());
+
+        let requests = seen.lock().clone();
+        assert!(
+            requests
+                .iter()
+                .any(|path| path.starts_with("/v1/wh-123/namespaces")),
+            "expected a /v1/wh-123/namespaces request, got: {:?}",
+            requests
+        );
+        // Sanity check: the unprefixed path must never be hit once a prefix
+        // has been resolved.
+        assert!(
+            !requests.iter().any(|path| path == "/v1/namespaces"),
+            "unprefixed /v1/namespaces must not be requested once a prefix is resolved, got: {:?}",
+            requests
+        );
     }
 
     #[test]
