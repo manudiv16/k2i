@@ -804,10 +804,16 @@ fn apply_file_io_props(config: &IcebergConfig, props: &mut HashMap<String, Strin
         props.insert("s3.endpoint".to_string(), endpoint.clone());
     }
     if let Some(access_key) = &config.aws_access_key_id {
-        props.insert("s3.access-key-id".to_string(), access_key.expose().to_string());
+        props.insert(
+            "s3.access-key-id".to_string(),
+            access_key.expose().to_string(),
+        );
     }
     if let Some(secret_key) = &config.aws_secret_access_key {
-        props.insert("s3.secret-access-key".to_string(), secret_key.expose().to_string());
+        props.insert(
+            "s3.secret-access-key".to_string(),
+            secret_key.expose().to_string(),
+        );
     }
     if let Some(region) = &config.aws_region {
         props.insert("s3.region".to_string(), region.clone());

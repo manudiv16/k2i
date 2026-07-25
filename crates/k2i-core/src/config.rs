@@ -485,7 +485,6 @@ pub enum CredentialType {
     OAuth2,
 }
 
-
 /// REST catalog advanced configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RestCatalogConfig {
@@ -1252,19 +1251,29 @@ impl Config {
             self.kafka.consumer_group = v;
         }
         if let Some(v) = env_val("K2I_KAFKA_BATCH_SIZE") {
-            if let Some(n) = parse_num("K2I_KAFKA_BATCH_SIZE", &v) { self.kafka.batch_size = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_BATCH_SIZE", &v) {
+                self.kafka.batch_size = n;
+            }
         }
         if let Some(v) = env_val("K2I_KAFKA_BATCH_TIMEOUT_MS") {
-            if let Some(n) = parse_num("K2I_KAFKA_BATCH_TIMEOUT_MS", &v) { self.kafka.batch_timeout_ms = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_BATCH_TIMEOUT_MS", &v) {
+                self.kafka.batch_timeout_ms = n;
+            }
         }
         if let Some(v) = env_val("K2I_KAFKA_SESSION_TIMEOUT_MS") {
-            if let Some(n) = parse_num("K2I_KAFKA_SESSION_TIMEOUT_MS", &v) { self.kafka.session_timeout_ms = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_SESSION_TIMEOUT_MS", &v) {
+                self.kafka.session_timeout_ms = n;
+            }
         }
         if let Some(v) = env_val("K2I_KAFKA_HEARTBEAT_INTERVAL_MS") {
-            if let Some(n) = parse_num("K2I_KAFKA_HEARTBEAT_INTERVAL_MS", &v) { self.kafka.heartbeat_interval_ms = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_HEARTBEAT_INTERVAL_MS", &v) {
+                self.kafka.heartbeat_interval_ms = n;
+            }
         }
         if let Some(v) = env_val("K2I_KAFKA_MAX_POLL_INTERVAL_MS") {
-            if let Some(n) = parse_num("K2I_KAFKA_MAX_POLL_INTERVAL_MS", &v) { self.kafka.max_poll_interval_ms = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_MAX_POLL_INTERVAL_MS", &v) {
+                self.kafka.max_poll_interval_ms = n;
+            }
         }
         if let Some(v) = env_val("K2I_KAFKA_AUTO_OFFSET_RESET") {
             match v.to_lowercase().as_str() {
@@ -1296,7 +1305,11 @@ impl Config {
                 "hive" => self.iceberg.catalog_type = CatalogType::Hive,
                 "nessie" => self.iceberg.catalog_type = CatalogType::Nessie,
                 "sql" => self.iceberg.catalog_type = CatalogType::Sql,
-                _ => warn_bad_enum("K2I_ICEBERG_CATALOG_TYPE", &v, &["rest", "glue", "hive", "nessie", "sql"]),
+                _ => warn_bad_enum(
+                    "K2I_ICEBERG_CATALOG_TYPE",
+                    &v,
+                    &["rest", "glue", "hive", "nessie", "sql"],
+                ),
             }
         }
         if let Some(v) = env_val("K2I_ICEBERG_WAREHOUSE_PATH") {
@@ -1344,27 +1357,43 @@ impl Config {
                 "manual" => self.schema_evolution.mode = SchemaEvolutionMode::Manual,
                 "auto-additive" => self.schema_evolution.mode = SchemaEvolutionMode::AutoAdditive,
                 "permissive" => self.schema_evolution.mode = SchemaEvolutionMode::Permissive,
-                _ => warn_bad_enum("K2I_SCHEMA_EVOLUTION_MODE", &v, &["manual", "auto-additive", "permissive"]),
+                _ => warn_bad_enum(
+                    "K2I_SCHEMA_EVOLUTION_MODE",
+                    &v,
+                    &["manual", "auto-additive", "permissive"],
+                ),
             }
         }
         if let Some(v) = env_val("K2I_SCHEMA_EVOLUTION_ON_BREAKING_CHANGE") {
             match v.to_lowercase().as_str() {
                 "pause" => self.schema_evolution.on_breaking_change = OnBreakingChange::Pause,
                 "fail" => self.schema_evolution.on_breaking_change = OnBreakingChange::Fail,
-                "skip-message" => self.schema_evolution.on_breaking_change = OnBreakingChange::SkipMessage,
-                _ => warn_bad_enum("K2I_SCHEMA_EVOLUTION_ON_BREAKING_CHANGE", &v, &["pause", "fail", "skip-message"]),
+                "skip-message" => {
+                    self.schema_evolution.on_breaking_change = OnBreakingChange::SkipMessage
+                }
+                _ => warn_bad_enum(
+                    "K2I_SCHEMA_EVOLUTION_ON_BREAKING_CHANGE",
+                    &v,
+                    &["pause", "fail", "skip-message"],
+                ),
             }
         }
 
         // --- Buffer ---
         if let Some(v) = env_val("K2I_BUFFER_TTL_SECONDS") {
-            if let Some(n) = parse_num("K2I_BUFFER_TTL_SECONDS", &v) { self.buffer.ttl_seconds = n; }
+            if let Some(n) = parse_num("K2I_BUFFER_TTL_SECONDS", &v) {
+                self.buffer.ttl_seconds = n;
+            }
         }
         if let Some(v) = env_val("K2I_BUFFER_MAX_SIZE_MB") {
-            if let Some(n) = parse_num("K2I_BUFFER_MAX_SIZE_MB", &v) { self.buffer.max_size_mb = n; }
+            if let Some(n) = parse_num("K2I_BUFFER_MAX_SIZE_MB", &v) {
+                self.buffer.max_size_mb = n;
+            }
         }
         if let Some(v) = env_val("K2I_BUFFER_FLUSH_INTERVAL_SECONDS") {
-            if let Some(n) = parse_num("K2I_BUFFER_FLUSH_INTERVAL_SECONDS", &v) { self.buffer.flush_interval_seconds = n; }
+            if let Some(n) = parse_num("K2I_BUFFER_FLUSH_INTERVAL_SECONDS", &v) {
+                self.buffer.flush_interval_seconds = n;
+            }
         }
 
         // --- Transaction log ---
@@ -1374,10 +1403,14 @@ impl Config {
 
         // --- Monitoring ---
         if let Some(v) = env_val("K2I_MONITORING_HEALTH_PORT") {
-            if let Some(n) = parse_num("K2I_MONITORING_HEALTH_PORT", &v) { self.monitoring.health_port = n; }
+            if let Some(n) = parse_num("K2I_MONITORING_HEALTH_PORT", &v) {
+                self.monitoring.health_port = n;
+            }
         }
         if let Some(v) = env_val("K2I_MONITORING_METRICS_PORT") {
-            if let Some(n) = parse_num("K2I_MONITORING_METRICS_PORT", &v) { self.monitoring.metrics_port = n; }
+            if let Some(n) = parse_num("K2I_MONITORING_METRICS_PORT", &v) {
+                self.monitoring.metrics_port = n;
+            }
         }
         if let Some(v) = env_val("K2I_MONITORING_LOG_LEVEL") {
             match v.to_lowercase().as_str() {
@@ -1386,7 +1419,11 @@ impl Config {
                 "info" => self.monitoring.log_level = LogLevel::Info,
                 "warn" => self.monitoring.log_level = LogLevel::Warn,
                 "error" => self.monitoring.log_level = LogLevel::Error,
-                _ => warn_bad_enum("K2I_MONITORING_LOG_LEVEL", &v, &["trace", "debug", "info", "warn", "error"]),
+                _ => warn_bad_enum(
+                    "K2I_MONITORING_LOG_LEVEL",
+                    &v,
+                    &["trace", "debug", "info", "warn", "error"],
+                ),
             }
         }
         if let Some(v) = env_val("K2I_MONITORING_LOG_FORMAT") {
