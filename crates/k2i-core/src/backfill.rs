@@ -356,8 +356,6 @@ mod tests {
                 aws_region: None,
                 aws_access_key_id: None,
                 aws_secret_access_key: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key_file: None,
                 s3_endpoint: None,
                 catalog_manager: CatalogManagerConfig::default(),
                 table_management: TableManagementConfig::default(),

@@ -5,6 +5,89 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// A configuration secret that redacts its value in `Debug` output.
+///
+/// In TOML it accepts either a plain string or a `{ file = "path" }` table,
+/// which supports Kubernetes projected-volume secrets:
+///
+/// ```toml
+/// sasl_password = "hunter2"
+/// # or
+/// sasl_password = { file = "/etc/secrets/k2i/kafka-password" }
+/// ```
+///
+/// File contents are trimmed. Read the value explicitly with
+/// [`Secret::expose`] or via `Deref` (`&*secret`).
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wrap a plaintext value as a secret.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Expose the secret value.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(REDACTED)")
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Plain(String),
+            FileRef { file: PathBuf },
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Plain(value) => Ok(Secret(value)),
+            Repr::FileRef { file } => {
+                let contents = std::fs::read_to_string(&file).map_err(|e| {
+                    serde::de::Error::custom(format!(
+                        "failed to read secret file '{}': {}",
+                        file.display(),
+                        e
+                    ))
+                })?;
+                Ok(Secret(contents.trim().to_string()))
+            }
+        }
+    }
+}
+
 /// Main configuration structure.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -205,17 +288,11 @@ pub struct KafkaSecurityConfig {
     /// SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
     pub sasl_mechanism: Option<String>,
 
-    /// SASL username
-    pub sasl_username: Option<String>,
+    /// SASL username (plain string or `{ file = "path" }`)
+    pub sasl_username: Option<Secret>,
 
-    /// SASL password
-    pub sasl_password: Option<String>,
-
-    /// Path to file containing SASL username (takes precedence over sasl_username)
-    pub sasl_username_file: Option<PathBuf>,
-
-    /// Path to file containing SASL password (takes precedence over sasl_password)
-    pub sasl_password_file: Option<PathBuf>,
+    /// SASL password (plain string or `{ file = "path" }`)
+    pub sasl_password: Option<Secret>,
 
     /// SSL CA certificate location
     pub ssl_ca_location: Option<PathBuf>,
@@ -263,17 +340,11 @@ pub struct IcebergConfig {
     /// AWS region (for Glue catalog and S3)
     pub aws_region: Option<String>,
 
-    /// AWS access key ID
-    pub aws_access_key_id: Option<String>,
+    /// AWS access key ID (plain string or `{ file = "path" }`)
+    pub aws_access_key_id: Option<Secret>,
 
-    /// Path to file containing AWS access key ID (takes precedence over aws_access_key_id)
-    pub aws_access_key_id_file: Option<PathBuf>,
-
-    /// AWS secret access key
-    pub aws_secret_access_key: Option<String>,
-
-    /// Path to file containing AWS secret access key (takes precedence over aws_secret_access_key)
-    pub aws_secret_access_key_file: Option<PathBuf>,
+    /// AWS secret access key (plain string or `{ file = "path" }`)
+    pub aws_secret_access_key: Option<Secret>,
 
     /// S3 endpoint (for MinIO or other S3-compatible storage)
     pub s3_endpoint: Option<String>,
@@ -422,30 +493,21 @@ pub struct RestCatalogConfig {
     #[serde(default)]
     pub credential_type: CredentialType,
 
-    /// Credential value (token for bearer auth)
+    /// Credential value (token for bearer auth; plain string or `{ file = "path" }`)
     #[serde(default)]
-    pub credential: Option<String>,
-
-    /// Path to file containing credential (takes precedence over credential)
-    pub credential_file: Option<PathBuf>,
+    pub credential: Option<Secret>,
 
     /// OAuth2 token endpoint (for oauth2 credential type)
     #[serde(default)]
     pub oauth2_token_endpoint: Option<String>,
 
-    /// OAuth2 client ID
+    /// OAuth2 client ID (plain string or `{ file = "path" }`)
     #[serde(default)]
-    pub oauth2_client_id: Option<String>,
+    pub oauth2_client_id: Option<Secret>,
 
-    /// Path to file containing OAuth2 client ID (takes precedence over oauth2_client_id)
-    pub oauth2_client_id_file: Option<PathBuf>,
-
-    /// OAuth2 client secret
+    /// OAuth2 client secret (plain string or `{ file = "path" }`)
     #[serde(default)]
-    pub oauth2_client_secret: Option<String>,
-
-    /// Path to file containing OAuth2 client secret (takes precedence over oauth2_client_secret)
-    pub oauth2_client_secret_file: Option<PathBuf>,
+    pub oauth2_client_secret: Option<Secret>,
 
     /// OAuth2 scope (optional)
     #[serde(default)]
@@ -465,12 +527,9 @@ impl Default for RestCatalogConfig {
         Self {
             credential_type: CredentialType::None,
             credential: None,
-            credential_file: None,
             oauth2_token_endpoint: None,
             oauth2_client_id: None,
-            oauth2_client_id_file: None,
             oauth2_client_secret: None,
-            oauth2_client_secret_file: None,
             oauth2_scope: None,
             request_timeout_seconds: Some(30),
             custom_headers: std::collections::HashMap::new(),
@@ -999,18 +1058,60 @@ fn default_auto_create() -> bool {
     true
 }
 
+/// Environment variables recognized by [`Config::apply_env_overrides`].
+///
+/// Keep in sync with the `env_val(...)` calls in that method.
+const KNOWN_ENV_VARS: &[&str] = &[
+    "K2I_KAFKA_BOOTSTRAP_SERVERS",
+    "K2I_KAFKA_TOPIC",
+    "K2I_KAFKA_CONSUMER_GROUP",
+    "K2I_KAFKA_BATCH_SIZE",
+    "K2I_KAFKA_BATCH_TIMEOUT_MS",
+    "K2I_KAFKA_SESSION_TIMEOUT_MS",
+    "K2I_KAFKA_HEARTBEAT_INTERVAL_MS",
+    "K2I_KAFKA_MAX_POLL_INTERVAL_MS",
+    "K2I_KAFKA_AUTO_OFFSET_RESET",
+    "K2I_KAFKA_SECURITY_PROTOCOL",
+    "K2I_KAFKA_SECURITY_SASL_MECHANISM",
+    "K2I_KAFKA_SECURITY_SASL_USERNAME",
+    "K2I_KAFKA_SECURITY_SASL_PASSWORD",
+    "K2I_ICEBERG_CATALOG_TYPE",
+    "K2I_ICEBERG_WAREHOUSE_PATH",
+    "K2I_ICEBERG_DATABASE_NAME",
+    "K2I_ICEBERG_TABLE_NAME",
+    "K2I_ICEBERG_AWS_REGION",
+    "K2I_ICEBERG_AWS_ACCESS_KEY_ID",
+    "K2I_ICEBERG_AWS_SECRET_ACCESS_KEY",
+    "K2I_ICEBERG_S3_ENDPOINT",
+    "K2I_ICEBERG_REST_URI",
+    "K2I_ICEBERG_HIVE_METASTORE_URI",
+    "K2I_ICEBERG_REST_CREDENTIAL",
+    "K2I_ICEBERG_REST_OAUTH2_CLIENT_ID",
+    "K2I_ICEBERG_REST_OAUTH2_CLIENT_SECRET",
+    "K2I_SCHEMA_EVOLUTION_MODE",
+    "K2I_SCHEMA_EVOLUTION_ON_BREAKING_CHANGE",
+    "K2I_BUFFER_TTL_SECONDS",
+    "K2I_BUFFER_MAX_SIZE_MB",
+    "K2I_BUFFER_FLUSH_INTERVAL_SECONDS",
+    "K2I_TRANSACTION_LOG_LOG_DIR",
+    "K2I_MONITORING_HEALTH_PORT",
+    "K2I_MONITORING_METRICS_PORT",
+    "K2I_MONITORING_LOG_LEVEL",
+    "K2I_MONITORING_LOG_FORMAT",
+    "K2I_RPC_ENABLED",
+    "K2I_RPC_SOCKET_PATH",
+];
+
 impl Config {
     /// Load configuration from a TOML file.
     ///
     /// Applies the following in order:
-    /// 1. Parse TOML values
-    /// 2. Resolve `_file` reference fields (reads secrets from files)
-    /// 3. Apply `K2I_*` environment variable overrides
-    /// 4. Validate the merged configuration
+    /// 1. Parse TOML values (secret `{ file = "..." }` refs resolve here)
+    /// 2. Apply `K2I_*` environment variable overrides
+    /// 3. Validate the merged configuration
     pub fn from_file(path: &std::path::Path) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut config: Config = toml::from_str(&content)?;
-        config.resolve_file_refs()?;
         config.apply_env_overrides();
         config.validate()?;
         Ok(config)
@@ -1113,81 +1214,31 @@ impl Config {
         Ok(())
     }
 
-    /// Resolve `_file` suffixed reference fields by reading their contents.
-    ///
-    /// Each `*_file` field specifies a path to a file whose (trimmed) contents
-    /// override the corresponding inline field. This supports Kubernetes
-    /// projected-volume secret injection.
-    fn resolve_file_refs(&mut self) -> crate::Result<()> {
-        // Kafka security
-        if let Some(path) = &self.kafka.security.sasl_username_file {
-            let val = std::fs::read_to_string(path)
-                .map_err(|e| crate::Error::Config(format!(
-                    "Failed to read kafka.security.sasl_username_file '{}': {}", path.display(), e
-                )))?;
-            self.kafka.security.sasl_username = Some(val.trim().to_string());
-        }
-        if let Some(path) = &self.kafka.security.sasl_password_file {
-            let val = std::fs::read_to_string(path)
-                .map_err(|e| crate::Error::Config(format!(
-                    "Failed to read kafka.security.sasl_password_file '{}': {}", path.display(), e
-                )))?;
-            self.kafka.security.sasl_password = Some(val.trim().to_string());
-        }
-
-        // Iceberg AWS credentials
-        if let Some(path) = &self.iceberg.aws_access_key_id_file {
-            let val = std::fs::read_to_string(path)
-                .map_err(|e| crate::Error::Config(format!(
-                    "Failed to read iceberg.aws_access_key_id_file '{}': {}", path.display(), e
-                )))?;
-            self.iceberg.aws_access_key_id = Some(val.trim().to_string());
-        }
-        if let Some(path) = &self.iceberg.aws_secret_access_key_file {
-            let val = std::fs::read_to_string(path)
-                .map_err(|e| crate::Error::Config(format!(
-                    "Failed to read iceberg.aws_secret_access_key_file '{}': {}", path.display(), e
-                )))?;
-            self.iceberg.aws_secret_access_key = Some(val.trim().to_string());
-        }
-
-        // REST catalog
-        if let Some(path) = &self.iceberg.rest.credential_file {
-            let val = std::fs::read_to_string(path)
-                .map_err(|e| crate::Error::Config(format!(
-                    "Failed to read iceberg.rest.credential_file '{}': {}", path.display(), e
-                )))?;
-            self.iceberg.rest.credential = Some(val.trim().to_string());
-        }
-        if let Some(path) = &self.iceberg.rest.oauth2_client_id_file {
-            let val = std::fs::read_to_string(path)
-                .map_err(|e| crate::Error::Config(format!(
-                    "Failed to read iceberg.rest.oauth2_client_id_file '{}': {}", path.display(), e
-                )))?;
-            self.iceberg.rest.oauth2_client_id = Some(val.trim().to_string());
-        }
-        if let Some(path) = &self.iceberg.rest.oauth2_client_secret_file {
-            let val = std::fs::read_to_string(path)
-                .map_err(|e| crate::Error::Config(format!(
-                    "Failed to read iceberg.rest.oauth2_client_secret_file '{}': {}", path.display(), e
-                )))?;
-            self.iceberg.rest.oauth2_client_secret = Some(val.trim().to_string());
-        }
-
-        Ok(())
-    }
-
-    /// Apply `K2I_*` environment variable overrides on top of TOML + file-ref values.
+    /// Apply `K2I_*` environment variable overrides on top of TOML values.
     ///
     /// Env vars use the convention `K2I_` + uppercase field path with `_` separators.
     /// For example: `K2I_KAFKA_TOPIC`, `K2I_ICEBERG_WAREHOUSE_PATH`, `K2I_KAFKA_SECURITY_SASL_PASSWORD`.
     ///
-    /// Parsing is best-effort — invalid values for numeric/enum fields are silently ignored
-    /// (the TOML or default value is preserved) so that misspellings don't break the process.
+    /// Invalid numeric/enum values are rejected with a warning (the TOML or
+    /// default value is preserved). Unrecognized `K2I_*` variables are also
+    /// logged so typos do not fail silently.
     fn apply_env_overrides(&mut self) {
-        /// Helper: read an env var if set.
         fn env_val(key: &str) -> Option<String> {
             std::env::var(key).ok()
+        }
+
+        fn parse_num<T: std::str::FromStr>(key: &str, v: &str) -> Option<T> {
+            match v.parse::<T>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!(var = key, value = %v, "Ignoring invalid numeric value");
+                    None
+                }
+            }
+        }
+
+        fn warn_bad_enum(key: &str, v: &str, valid: &[&str]) {
+            tracing::warn!(var = key, value = %v, valid = ?valid, "Ignoring invalid enum value");
         }
 
         // --- Kafka ---
@@ -1201,25 +1252,25 @@ impl Config {
             self.kafka.consumer_group = v;
         }
         if let Some(v) = env_val("K2I_KAFKA_BATCH_SIZE") {
-            if let Ok(n) = v.parse() { self.kafka.batch_size = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_BATCH_SIZE", &v) { self.kafka.batch_size = n; }
         }
         if let Some(v) = env_val("K2I_KAFKA_BATCH_TIMEOUT_MS") {
-            if let Ok(n) = v.parse() { self.kafka.batch_timeout_ms = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_BATCH_TIMEOUT_MS", &v) { self.kafka.batch_timeout_ms = n; }
         }
         if let Some(v) = env_val("K2I_KAFKA_SESSION_TIMEOUT_MS") {
-            if let Ok(n) = v.parse() { self.kafka.session_timeout_ms = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_SESSION_TIMEOUT_MS", &v) { self.kafka.session_timeout_ms = n; }
         }
         if let Some(v) = env_val("K2I_KAFKA_HEARTBEAT_INTERVAL_MS") {
-            if let Ok(n) = v.parse() { self.kafka.heartbeat_interval_ms = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_HEARTBEAT_INTERVAL_MS", &v) { self.kafka.heartbeat_interval_ms = n; }
         }
         if let Some(v) = env_val("K2I_KAFKA_MAX_POLL_INTERVAL_MS") {
-            if let Ok(n) = v.parse() { self.kafka.max_poll_interval_ms = n; }
+            if let Some(n) = parse_num("K2I_KAFKA_MAX_POLL_INTERVAL_MS", &v) { self.kafka.max_poll_interval_ms = n; }
         }
         if let Some(v) = env_val("K2I_KAFKA_AUTO_OFFSET_RESET") {
             match v.to_lowercase().as_str() {
                 "earliest" => self.kafka.auto_offset_reset = OffsetReset::Earliest,
                 "latest" => self.kafka.auto_offset_reset = OffsetReset::Latest,
-                _ => {}
+                _ => warn_bad_enum("K2I_KAFKA_AUTO_OFFSET_RESET", &v, &["earliest", "latest"]),
             }
         }
 
@@ -1231,10 +1282,10 @@ impl Config {
             self.kafka.security.sasl_mechanism = Some(v);
         }
         if let Some(v) = env_val("K2I_KAFKA_SECURITY_SASL_USERNAME") {
-            self.kafka.security.sasl_username = Some(v);
+            self.kafka.security.sasl_username = Some(Secret::new(v));
         }
         if let Some(v) = env_val("K2I_KAFKA_SECURITY_SASL_PASSWORD") {
-            self.kafka.security.sasl_password = Some(v);
+            self.kafka.security.sasl_password = Some(Secret::new(v));
         }
 
         // --- Iceberg ---
@@ -1245,7 +1296,7 @@ impl Config {
                 "hive" => self.iceberg.catalog_type = CatalogType::Hive,
                 "nessie" => self.iceberg.catalog_type = CatalogType::Nessie,
                 "sql" => self.iceberg.catalog_type = CatalogType::Sql,
-                _ => {}
+                _ => warn_bad_enum("K2I_ICEBERG_CATALOG_TYPE", &v, &["rest", "glue", "hive", "nessie", "sql"]),
             }
         }
         if let Some(v) = env_val("K2I_ICEBERG_WAREHOUSE_PATH") {
@@ -1261,10 +1312,10 @@ impl Config {
             self.iceberg.aws_region = Some(v);
         }
         if let Some(v) = env_val("K2I_ICEBERG_AWS_ACCESS_KEY_ID") {
-            self.iceberg.aws_access_key_id = Some(v);
+            self.iceberg.aws_access_key_id = Some(Secret::new(v));
         }
         if let Some(v) = env_val("K2I_ICEBERG_AWS_SECRET_ACCESS_KEY") {
-            self.iceberg.aws_secret_access_key = Some(v);
+            self.iceberg.aws_secret_access_key = Some(Secret::new(v));
         }
         if let Some(v) = env_val("K2I_ICEBERG_S3_ENDPOINT") {
             self.iceberg.s3_endpoint = Some(v);
@@ -1278,13 +1329,13 @@ impl Config {
 
         // REST catalog advanced
         if let Some(v) = env_val("K2I_ICEBERG_REST_CREDENTIAL") {
-            self.iceberg.rest.credential = Some(v);
+            self.iceberg.rest.credential = Some(Secret::new(v));
         }
         if let Some(v) = env_val("K2I_ICEBERG_REST_OAUTH2_CLIENT_ID") {
-            self.iceberg.rest.oauth2_client_id = Some(v);
+            self.iceberg.rest.oauth2_client_id = Some(Secret::new(v));
         }
         if let Some(v) = env_val("K2I_ICEBERG_REST_OAUTH2_CLIENT_SECRET") {
-            self.iceberg.rest.oauth2_client_secret = Some(v);
+            self.iceberg.rest.oauth2_client_secret = Some(Secret::new(v));
         }
 
         // --- Schema evolution ---
@@ -1293,7 +1344,7 @@ impl Config {
                 "manual" => self.schema_evolution.mode = SchemaEvolutionMode::Manual,
                 "auto-additive" => self.schema_evolution.mode = SchemaEvolutionMode::AutoAdditive,
                 "permissive" => self.schema_evolution.mode = SchemaEvolutionMode::Permissive,
-                _ => {}
+                _ => warn_bad_enum("K2I_SCHEMA_EVOLUTION_MODE", &v, &["manual", "auto-additive", "permissive"]),
             }
         }
         if let Some(v) = env_val("K2I_SCHEMA_EVOLUTION_ON_BREAKING_CHANGE") {
@@ -1301,19 +1352,19 @@ impl Config {
                 "pause" => self.schema_evolution.on_breaking_change = OnBreakingChange::Pause,
                 "fail" => self.schema_evolution.on_breaking_change = OnBreakingChange::Fail,
                 "skip-message" => self.schema_evolution.on_breaking_change = OnBreakingChange::SkipMessage,
-                _ => {}
+                _ => warn_bad_enum("K2I_SCHEMA_EVOLUTION_ON_BREAKING_CHANGE", &v, &["pause", "fail", "skip-message"]),
             }
         }
 
         // --- Buffer ---
         if let Some(v) = env_val("K2I_BUFFER_TTL_SECONDS") {
-            if let Ok(n) = v.parse() { self.buffer.ttl_seconds = n; }
+            if let Some(n) = parse_num("K2I_BUFFER_TTL_SECONDS", &v) { self.buffer.ttl_seconds = n; }
         }
         if let Some(v) = env_val("K2I_BUFFER_MAX_SIZE_MB") {
-            if let Ok(n) = v.parse() { self.buffer.max_size_mb = n; }
+            if let Some(n) = parse_num("K2I_BUFFER_MAX_SIZE_MB", &v) { self.buffer.max_size_mb = n; }
         }
         if let Some(v) = env_val("K2I_BUFFER_FLUSH_INTERVAL_SECONDS") {
-            if let Ok(n) = v.parse() { self.buffer.flush_interval_seconds = n; }
+            if let Some(n) = parse_num("K2I_BUFFER_FLUSH_INTERVAL_SECONDS", &v) { self.buffer.flush_interval_seconds = n; }
         }
 
         // --- Transaction log ---
@@ -1323,10 +1374,10 @@ impl Config {
 
         // --- Monitoring ---
         if let Some(v) = env_val("K2I_MONITORING_HEALTH_PORT") {
-            if let Ok(p) = v.parse() { self.monitoring.health_port = p; }
+            if let Some(n) = parse_num("K2I_MONITORING_HEALTH_PORT", &v) { self.monitoring.health_port = n; }
         }
         if let Some(v) = env_val("K2I_MONITORING_METRICS_PORT") {
-            if let Ok(p) = v.parse() { self.monitoring.metrics_port = p; }
+            if let Some(n) = parse_num("K2I_MONITORING_METRICS_PORT", &v) { self.monitoring.metrics_port = n; }
         }
         if let Some(v) = env_val("K2I_MONITORING_LOG_LEVEL") {
             match v.to_lowercase().as_str() {
@@ -1335,14 +1386,14 @@ impl Config {
                 "info" => self.monitoring.log_level = LogLevel::Info,
                 "warn" => self.monitoring.log_level = LogLevel::Warn,
                 "error" => self.monitoring.log_level = LogLevel::Error,
-                _ => {}
+                _ => warn_bad_enum("K2I_MONITORING_LOG_LEVEL", &v, &["trace", "debug", "info", "warn", "error"]),
             }
         }
         if let Some(v) = env_val("K2I_MONITORING_LOG_FORMAT") {
             match v.to_lowercase().as_str() {
                 "json" => self.monitoring.log_format = LogFormat::Json,
                 "text" => self.monitoring.log_format = LogFormat::Text,
-                _ => {}
+                _ => warn_bad_enum("K2I_MONITORING_LOG_FORMAT", &v, &["json", "text"]),
             }
         }
 
@@ -1352,6 +1403,14 @@ impl Config {
         }
         if let Some(v) = env_val("K2I_RPC_SOCKET_PATH") {
             self.rpc.socket_path = std::path::PathBuf::from(v);
+        }
+
+        // Warn on unrecognized K2I_* variables (typo detection).
+        for (key, _) in std::env::vars_os() {
+            let key = key.to_string_lossy();
+            if key.starts_with("K2I_") && !KNOWN_ENV_VARS.contains(&key.as_ref()) {
+                tracing::warn!(var = %key, "Unrecognized K2I_* environment variable ignored");
+            }
         }
     }
 }
@@ -1398,8 +1457,6 @@ mod tests {
                 aws_region: None,
                 aws_access_key_id: None,
                 aws_secret_access_key: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key_file: None,
                 s3_endpoint: None,
                 catalog_manager: CatalogManagerConfig::default(),
                 table_management: TableManagementConfig::default(),
@@ -1449,8 +1506,6 @@ mod tests {
                 aws_region: None,
                 aws_access_key_id: None,
                 aws_secret_access_key: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key_file: None,
                 s3_endpoint: None,
                 catalog_manager: CatalogManagerConfig::default(),
                 table_management: TableManagementConfig::default(),
@@ -1624,8 +1679,6 @@ mod tests {
                 aws_region: None,
                 aws_access_key_id: None,
                 aws_secret_access_key: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key_file: None,
                 s3_endpoint: None,
                 catalog_manager: CatalogManagerConfig::default(),
                 table_management: TableManagementConfig::default(),
@@ -1676,8 +1729,6 @@ mod tests {
                 aws_region: None,
                 aws_access_key_id: None,
                 aws_secret_access_key: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key_file: None,
                 s3_endpoint: None,
                 catalog_manager: CatalogManagerConfig::default(),
                 table_management: TableManagementConfig::default(),
@@ -1728,8 +1779,6 @@ mod tests {
                 aws_region: None,
                 aws_access_key_id: None,
                 aws_secret_access_key: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key_file: None,
                 s3_endpoint: None,
                 catalog_manager: CatalogManagerConfig::default(),
                 table_management: TableManagementConfig::default(),
@@ -1756,13 +1805,11 @@ mod tests {
         let config = KafkaSecurityConfig {
             protocol: Some("SASL_SSL".to_string()),
             sasl_mechanism: Some("SCRAM-SHA-256".to_string()),
-            sasl_username: Some("user".to_string()),
-            sasl_password: Some("pass".to_string()),
+            sasl_username: Some("user".into()),
+            sasl_password: Some("pass".into()),
             ssl_ca_location: Some(PathBuf::from("/path/to/ca.pem")),
             ssl_cert_location: None,
             ssl_key_location: None,
-            sasl_username_file: None,
-            sasl_password_file: None,
         };
 
         assert_eq!(config.protocol, Some("SASL_SSL".to_string()));
@@ -1830,20 +1877,17 @@ mod tests {
 
         let config = RestCatalogConfig {
             credential_type: CredentialType::Bearer,
-            credential: Some("token123".to_string()),
-            credential_file: None,
+            credential: Some("token123".into()),
             oauth2_token_endpoint: None,
             oauth2_client_id: None,
-            oauth2_client_id_file: None,
             oauth2_client_secret: None,
-            oauth2_client_secret_file: None,
             oauth2_scope: None,
             request_timeout_seconds: Some(60),
             custom_headers: headers,
         };
 
         assert_eq!(config.credential_type, CredentialType::Bearer);
-        assert_eq!(config.credential, Some("token123".to_string()));
+        assert_eq!(config.credential.as_deref(), Some("token123"));
         assert_eq!(config.request_timeout_seconds, Some(60));
         assert_eq!(config.custom_headers.len(), 1);
     }
@@ -1860,192 +1904,174 @@ mod tests {
         assert!(config.external_id.is_some());
         assert!(config.catalog_id.is_some());
     }
-    #[test]
-    fn test_file_ref_resolves_values() {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn test_secret_file_ref_from_toml() {
         let dir = tempfile::tempdir().unwrap();
-        let user_path = dir.path().join("sasl_user");
-        let pass_path = dir.path().join("sasl_pass");
-        std::fs::write(&user_path, "admin\n").unwrap();
+        let pass_path = dir.path().join("kafka-password");
         std::fs::write(&pass_path, "hunter2\n").unwrap();
 
-        let mut config = Config {
-            kafka: KafkaConfig {
-                bootstrap_servers: vec!["localhost:9092".into()],
-                topic: "test".into(),
-                consumer_group: "test-group".into(),
-                batch_size: default_batch_size(),
-                batch_timeout_ms: default_batch_timeout_ms(),
-                session_timeout_ms: default_session_timeout_ms(),
-                heartbeat_interval_ms: default_heartbeat_interval_ms(),
-                max_poll_interval_ms: default_max_poll_interval_ms(),
-                auto_offset_reset: OffsetReset::Earliest,
-                security: KafkaSecurityConfig {
-                    sasl_username_file: Some(user_path),
-                    sasl_password_file: Some(pass_path),
-                    ..KafkaSecurityConfig::default()
-                },
-                format: KafkaFormatConfig::Raw,
-            },
-            schema_evolution: SchemaEvolutionRuntimeConfig::default(),
-            iceberg: IcebergConfig {
-                catalog_type: CatalogType::Sql,
-                warehouse_path: "/tmp/warehouse".into(),
-                database_name: "db".into(),
-                table_name: "tbl".into(),
-                target_file_size_mb: default_target_file_size_mb(),
-                compression: ParquetCompression::Snappy,
-                partition_spec: vec![],
-                rest_uri: None,
-                hive_metastore_uri: None,
-                aws_region: None,
-                aws_access_key_id: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key: None,
-                aws_secret_access_key_file: None,
-                s3_endpoint: None,
-                catalog_manager: CatalogManagerConfig::default(),
-                table_management: TableManagementConfig::default(),
-                rest: RestCatalogConfig::default(),
-                glue: GlueCatalogConfig::default(),
-                nessie: None,
-                sql_catalog: None,
-                object_store: ObjectStoreConfig::default(),
-            },
-            buffer: BufferConfig::default(),
-            transaction_log: TransactionLogConfig::default(),
-            maintenance: MaintenanceConfig::default(),
-            monitoring: MonitoringConfig::default(),
-            rpc: RpcConfig::default(),
+        let toml = format!(
+            r#"
+[kafka]
+bootstrap_servers = ["localhost:9092"]
+topic = "events"
+consumer_group = "k2i"
+
+[kafka.security]
+protocol = "SASL_SSL"
+sasl_password = {{ file = "{}" }}
+
+[iceberg]
+catalog_type = "sql"
+warehouse_path = "/tmp/warehouse"
+database_name = "db"
+table_name = "tbl"
+"#,
+            pass_path.display()
+        );
+
+        let config: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(
+            config.kafka.security.sasl_password.as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn test_secret_file_ref_missing_file_errors() {
+        let toml = r#"
+[kafka]
+bootstrap_servers = ["localhost:9092"]
+topic = "events"
+consumer_group = "k2i"
+
+[kafka.security]
+sasl_password = { file = "/nonexistent/secret/path" }
+
+[iceberg]
+catalog_type = "sql"
+warehouse_path = "/tmp/warehouse"
+database_name = "db"
+table_name = "tbl"
+"#;
+
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(err.to_string().contains("failed to read secret file"));
+    }
+
+    #[test]
+    fn test_secret_plain_string_still_works() {
+        let toml = r#"
+[kafka]
+bootstrap_servers = ["localhost:9092"]
+topic = "events"
+consumer_group = "k2i"
+
+[kafka.security]
+sasl_password = "hunter2"
+
+[iceberg]
+catalog_type = "sql"
+warehouse_path = "/tmp/warehouse"
+database_name = "db"
+table_name = "tbl"
+"#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.kafka.security.sasl_password.as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn test_secret_debug_is_redacted() {
+        let config = KafkaSecurityConfig {
+            sasl_password: Some(Secret::new("hunter2")),
+            ..KafkaSecurityConfig::default()
         };
-
-        config.resolve_file_refs().unwrap();
-
-        assert_eq!(config.kafka.security.sasl_username, Some("admin".to_string()));
-        assert_eq!(config.kafka.security.sasl_password, Some("hunter2".to_string()));
+        let debug = format!("{:?}", config);
+        assert!(!debug.contains("hunter2"));
+        assert!(debug.contains("REDACTED"));
     }
 
     #[test]
     fn test_env_override_string_field() {
-        // Set env var and ensure it overrides the TOML value
-        unsafe { std::env::set_var("K2I_KAFKA_TOPIC", "env-topic"); }
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("K2I_KAFKA_TOPIC", "env-topic");
 
-        let mut config = Config {
-            kafka: KafkaConfig {
-                bootstrap_servers: vec!["localhost:9092".into()],
-                topic: "toml-topic".into(),
-                consumer_group: "test-group".into(),
-                batch_size: default_batch_size(),
-                batch_timeout_ms: default_batch_timeout_ms(),
-                session_timeout_ms: default_session_timeout_ms(),
-                heartbeat_interval_ms: default_heartbeat_interval_ms(),
-                max_poll_interval_ms: default_max_poll_interval_ms(),
-                auto_offset_reset: OffsetReset::Earliest,
-                security: KafkaSecurityConfig::default(),
-                format: KafkaFormatConfig::Raw,
-            },
-            schema_evolution: SchemaEvolutionRuntimeConfig::default(),
-            iceberg: IcebergConfig {
-                catalog_type: CatalogType::Sql,
-                warehouse_path: "/tmp/warehouse".into(),
-                database_name: "db".into(),
-                table_name: "tbl".into(),
-                target_file_size_mb: default_target_file_size_mb(),
-                compression: ParquetCompression::Snappy,
-                partition_spec: vec![],
-                rest_uri: None,
-                hive_metastore_uri: None,
-                aws_region: None,
-                aws_access_key_id: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key: None,
-                aws_secret_access_key_file: None,
-                s3_endpoint: None,
-                catalog_manager: CatalogManagerConfig::default(),
-                table_management: TableManagementConfig::default(),
-                rest: RestCatalogConfig::default(),
-                glue: GlueCatalogConfig::default(),
-                nessie: None,
-                sql_catalog: None,
-                object_store: ObjectStoreConfig::default(),
-            },
-            buffer: BufferConfig::default(),
-            transaction_log: TransactionLogConfig::default(),
-            maintenance: MaintenanceConfig::default(),
-            monitoring: MonitoringConfig::default(),
-            rpc: RpcConfig::default(),
-        };
+        let mut config = test_config();
+        config.kafka.topic = "toml-topic".into();
 
         config.apply_env_overrides();
 
         assert_eq!(config.kafka.topic, "env-topic");
 
-        // Clean up
-        unsafe { std::env::remove_var("K2I_KAFKA_TOPIC"); }
+        std::env::remove_var("K2I_KAFKA_TOPIC");
     }
 
     #[test]
     fn test_env_override_numeric_field() {
-        unsafe { std::env::set_var("K2I_KAFKA_BATCH_SIZE", "500"); }
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("K2I_KAFKA_BATCH_SIZE", "500");
 
-        let mut config = Config {
-            kafka: KafkaConfig {
-                bootstrap_servers: vec!["localhost:9092".into()],
-                topic: "test".into(),
-                consumer_group: "test-group".into(),
-                batch_size: 1000,
-                batch_timeout_ms: default_batch_timeout_ms(),
-                session_timeout_ms: default_session_timeout_ms(),
-                heartbeat_interval_ms: default_heartbeat_interval_ms(),
-                max_poll_interval_ms: default_max_poll_interval_ms(),
-                auto_offset_reset: OffsetReset::Earliest,
-                security: KafkaSecurityConfig::default(),
-                format: KafkaFormatConfig::Raw,
-            },
-            schema_evolution: SchemaEvolutionRuntimeConfig::default(),
-            iceberg: IcebergConfig {
-                catalog_type: CatalogType::Sql,
-                warehouse_path: "/tmp/warehouse".into(),
-                database_name: "db".into(),
-                table_name: "tbl".into(),
-                target_file_size_mb: default_target_file_size_mb(),
-                compression: ParquetCompression::Snappy,
-                partition_spec: vec![],
-                rest_uri: None,
-                hive_metastore_uri: None,
-                aws_region: None,
-                aws_access_key_id: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key: None,
-                aws_secret_access_key_file: None,
-                s3_endpoint: None,
-                catalog_manager: CatalogManagerConfig::default(),
-                table_management: TableManagementConfig::default(),
-                rest: RestCatalogConfig::default(),
-                glue: GlueCatalogConfig::default(),
-                nessie: None,
-                sql_catalog: None,
-                object_store: ObjectStoreConfig::default(),
-            },
-            buffer: BufferConfig::default(),
-            transaction_log: TransactionLogConfig::default(),
-            maintenance: MaintenanceConfig::default(),
-            monitoring: MonitoringConfig::default(),
-            rpc: RpcConfig::default(),
-        };
-
+        let mut config = test_config();
         config.apply_env_overrides();
 
         assert_eq!(config.kafka.batch_size, 500);
 
-        unsafe { std::env::remove_var("K2I_KAFKA_BATCH_SIZE"); }
+        std::env::remove_var("K2I_KAFKA_BATCH_SIZE");
     }
 
     #[test]
     fn test_env_override_iceberg_enum() {
-        unsafe { std::env::set_var("K2I_ICEBERG_CATALOG_TYPE", "nessie"); }
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("K2I_ICEBERG_CATALOG_TYPE", "nessie");
 
-        let mut config = Config {
+        let mut config = test_config();
+        config.apply_env_overrides();
+
+        assert_eq!(config.iceberg.catalog_type, CatalogType::Nessie);
+
+        std::env::remove_var("K2I_ICEBERG_CATALOG_TYPE");
+    }
+
+    #[test]
+    fn test_env_override_invalid_numeric_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("K2I_KAFKA_BATCH_SIZE", "not-a-number");
+
+        let mut config = test_config();
+        config.kafka.batch_size = 1000;
+        config.apply_env_overrides();
+
+        // Invalid parse should leave the original value intact
+        assert_eq!(config.kafka.batch_size, 1000);
+
+        std::env::remove_var("K2I_KAFKA_BATCH_SIZE");
+    }
+
+    #[test]
+    fn test_env_override_secret_field() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("K2I_KAFKA_SECURITY_SASL_PASSWORD", "env-secret");
+
+        let mut config = test_config();
+        config.apply_env_overrides();
+
+        assert_eq!(
+            config.kafka.security.sasl_password.as_deref(),
+            Some("env-secret")
+        );
+
+        std::env::remove_var("K2I_KAFKA_SECURITY_SASL_PASSWORD");
+    }
+
+    /// Build a minimal valid Config for override tests.
+    fn test_config() -> Config {
+        Config {
             kafka: KafkaConfig {
                 bootstrap_servers: vec!["localhost:9092".into()],
                 topic: "test".into(),
@@ -2072,9 +2098,7 @@ mod tests {
                 hive_metastore_uri: None,
                 aws_region: None,
                 aws_access_key_id: None,
-                aws_access_key_id_file: None,
                 aws_secret_access_key: None,
-                aws_secret_access_key_file: None,
                 s3_endpoint: None,
                 catalog_manager: CatalogManagerConfig::default(),
                 table_management: TableManagementConfig::default(),
@@ -2089,70 +2113,6 @@ mod tests {
             maintenance: MaintenanceConfig::default(),
             monitoring: MonitoringConfig::default(),
             rpc: RpcConfig::default(),
-        };
-
-        config.apply_env_overrides();
-
-        assert_eq!(config.iceberg.catalog_type, CatalogType::Nessie);
-
-        unsafe { std::env::remove_var("K2I_ICEBERG_CATALOG_TYPE"); }
-    }
-
-    #[test]
-    fn test_env_override_invalid_numeric_ignored() {
-        unsafe { std::env::set_var("K2I_KAFKA_BATCH_SIZE", "not-a-number"); }
-
-        let mut config = Config {
-            kafka: KafkaConfig {
-                bootstrap_servers: vec!["localhost:9092".into()],
-                topic: "test".into(),
-                consumer_group: "test-group".into(),
-                batch_size: 1000,
-                batch_timeout_ms: default_batch_timeout_ms(),
-                session_timeout_ms: default_session_timeout_ms(),
-                heartbeat_interval_ms: default_heartbeat_interval_ms(),
-                max_poll_interval_ms: default_max_poll_interval_ms(),
-                auto_offset_reset: OffsetReset::Earliest,
-                security: KafkaSecurityConfig::default(),
-                format: KafkaFormatConfig::Raw,
-            },
-            schema_evolution: SchemaEvolutionRuntimeConfig::default(),
-            iceberg: IcebergConfig {
-                catalog_type: CatalogType::Sql,
-                warehouse_path: "/tmp/warehouse".into(),
-                database_name: "db".into(),
-                table_name: "tbl".into(),
-                target_file_size_mb: default_target_file_size_mb(),
-                compression: ParquetCompression::Snappy,
-                partition_spec: vec![],
-                rest_uri: None,
-                hive_metastore_uri: None,
-                aws_region: None,
-                aws_access_key_id: None,
-                aws_access_key_id_file: None,
-                aws_secret_access_key: None,
-                aws_secret_access_key_file: None,
-                s3_endpoint: None,
-                catalog_manager: CatalogManagerConfig::default(),
-                table_management: TableManagementConfig::default(),
-                rest: RestCatalogConfig::default(),
-                glue: GlueCatalogConfig::default(),
-                nessie: None,
-                sql_catalog: None,
-                object_store: ObjectStoreConfig::default(),
-            },
-            buffer: BufferConfig::default(),
-            transaction_log: TransactionLogConfig::default(),
-            maintenance: MaintenanceConfig::default(),
-            monitoring: MonitoringConfig::default(),
-            rpc: RpcConfig::default(),
-        };
-
-        config.apply_env_overrides();
-
-        // Invalid parse should leave the original value intact
-        assert_eq!(config.kafka.batch_size, 1000);
-
-        unsafe { std::env::remove_var("K2I_KAFKA_BATCH_SIZE"); }
+        }
     }
 }

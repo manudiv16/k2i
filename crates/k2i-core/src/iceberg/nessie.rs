@@ -115,7 +115,11 @@ impl NessieCatalogClient {
             timeout,
             max_retries: config.catalog_manager.max_retries,
             credential_type: config.rest.credential_type.clone(),
-            bearer_token: config.rest.credential.clone(),
+            bearer_token: config
+                .rest
+                .credential
+                .as_ref()
+                .map(|s| s.expose().to_string()),
             warehouse_path: config.warehouse_path.clone(),
             default_reference: default_ref.clone(),
             api_version,
@@ -818,8 +822,6 @@ mod tests {
             aws_region: None,
             aws_access_key_id: None,
             aws_secret_access_key: None,
-            aws_access_key_id_file: None,
-            aws_secret_access_key_file: None,
             s3_endpoint: None,
             catalog_manager: Default::default(),
             table_management: Default::default(),
