@@ -664,7 +664,7 @@ mod end_to_end {
 }
 
 /// End-to-end verification that data files land where the Iceberg catalog says
-/// they do, against a real S3 implementation (Adobe S3Mock).
+/// they do, against a live S3-compatible server (Adobe S3Mock).
 ///
 /// For cloud backends the object store is rooted at the *bucket*, while the
 /// catalog, the transaction log, and the read path all locate a data file by
@@ -742,7 +742,7 @@ mod s3_object_store_integration {
             partition_spec: vec![],
             rest_uri: None,
             hive_metastore_uri: None,
-            aws_region: Some("us-east-1".to_string()),
+            aws_region: Some(REGION.to_string()),
             aws_access_key_id: Some(ACCESS_KEY.into()),
             aws_secret_access_key: Some(SECRET_KEY.into()),
             s3_endpoint: Some(endpoint.to_string()),
