@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Cleared the RustSec advisories reported by the `Security Audit` job and re-documented the remaining explicit acceptances in `scripts/security-audit.sh`. Upgraded `sqlx` to 0.9 (the MySQL graph no longer pulls `rsa`, so `RUSTSEC-2023-0071` is no longer accepted), `libsqlite3-sys` to 0.39.1, Arrow/Parquet to 58.4.2 (which moves `thrift` to 0.23), the AWS SDK HTTP client, `tokio`, `rustls`, `rustls-webpki`, `quinn-proto`, `quinn-udp`, `zstd`, and other patch-level dependencies. The advisories that remain are pinned transitive versions in the iceberg/object_store/AWS SDK graph or unmaintained crates without a reported vulnerability.
+
 ## [0.3.0] - 2026-07-28
 
 ### Added
